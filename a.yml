@@ -1,0 +1,188 @@
+name: Deploy Azure Databricks Workspace
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace_config:
+        description: 'Workspace configuration to deploy'
+        required: true
+        type: choice
+        options:
+          - abc-nonprod-east
+          - abc-nonprod-west
+
+# Required permissions for OIDC authentication
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: '1.5.0'
+  WORKING_DIR: './terraform/workspaces'
+
+jobs:
+  terraform-plan:
+    name: 'Plan - ${{ github.event.inputs.workspace_config }}'
+    runs-on: ubuntu-latest-aa
+    
+    # Set environment based on workspace config
+    environment: ${{ contains(github.event.inputs.workspace_config, 'prod') && 'production' || 'nonprod' }}
+    
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+    
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Log into Azure using OIDC
+        id: azureloginoidc
+        uses: azure/login@v2
+        with:
+          client-id: "${{ vars.AZURE_CLIENT_ID }}"
+          tenant-id: "${{ vars.AZURE_TENANT_ID }}"
+          subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          enable-AzPSSession: true
+
+      - name: Set Azure credentials for Terraform
+        run: |
+          echo "ARM_CLIENT_ID=${{ vars.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ vars.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ vars.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ github.event.inputs.workspace_config }}.tfstate"
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="${{ github.event.inputs.workspace_config }}.tfvars" \
+            -out=tfplan \
+            -no-color \
+            -detailed-exitcode || export EXITCODE=$?
+          echo "exitcode=$EXITCODE" >> $GITHUB_OUTPUT
+          exit 0
+
+      - name: Plan Summary
+        run: |
+          echo "### Terraform Plan Summary " >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workspace Config:** ${{ github.event.inputs.workspace_config }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Format Check:** ${{ steps.fmt.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Initialization:** ${{ steps.init.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Validation:** ${{ steps.validate.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Plan:** ${{ steps.plan.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo " Plan completed successfully. Review the plan above and proceed to Apply job." >> $GITHUB_STEP_SUMMARY
+
+  terraform-apply:
+    name: 'Apply - ${{ github.event.inputs.workspace_config }}'
+    runs-on: ubuntu-latest-aa
+    needs: terraform-plan
+    
+    # Set environment based on workspace config
+    environment: ${{ contains(github.event.inputs.workspace_config, 'prod') && 'production' || 'nonprod' }}
+    
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Log into Azure using OIDC
+        id: azureloginoidc
+        uses: azure/login@v2
+        with:
+          client-id: "${{ vars.AZURE_CLIENT_ID }}"
+          tenant-id: "${{ vars.AZURE_TENANT_ID }}"
+          subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          enable-AzPSSession: true
+
+      - name: Set Azure credentials for Terraform
+        run: |
+          echo "ARM_CLIENT_ID=${{ vars.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ vars.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ vars.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ github.event.inputs.workspace_config }}.tfstate"
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.workspace_config }}
+          path: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Apply
+        id: apply
+        run: |
+          terraform apply -auto-approve tfplan
+
+      - name: Get Outputs
+        id: output
+        if: success()
+        run: |
+          echo "workspace_url=$(terraform output -raw workspace_url)" >> $GITHUB_OUTPUT
+          echo "workspace_name=$(terraform output -raw workspace_name)" >> $GITHUB_OUTPUT
+          echo "workspace_id=$(terraform output -raw workspace_id)" >> $GITHUB_OUTPUT
+
+      - name: Apply Summary
+        if: always()
+        run: |
+          echo "### Terraform Apply Summary " >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workspace Config:** ${{ github.event.inputs.workspace_config }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.output.outcome }}" == "success" ]; then
+            echo "#### Workspace Deployed Successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Workspace Details:**" >> $GITHUB_STEP_SUMMARY
+            echo "- **Name:** ${{ steps.output.outputs.workspace_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **URL:** [${{ steps.output.outputs.workspace_url }}](${{ steps.output.outputs.workspace_url }})" >> $GITHUB_STEP_SUMMARY
+            echo "- **ID:** ${{ steps.output.outputs.workspace_id }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo " Apply failed. Check the logs above for details." >> $GITHUB_STEP_SUMMARY
+          fi
